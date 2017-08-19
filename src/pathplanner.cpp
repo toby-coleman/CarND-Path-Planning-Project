@@ -7,6 +7,7 @@
  */
 
 #include "pathplanner.h"
+#include <iostream>
 
 PathPlanner::PathPlanner(vector<double> map_waypoints_x,
                          vector<double> map_waypoints_y,
@@ -29,26 +30,134 @@ PathPlanner::PathPlanner(vector<double> map_waypoints_x,
         6 * T, 12 * T2, 20 * T3;
 }
 
-vector<vector<double>> PathPlanner::update(double car_x,
-                                           double car_y,
+vector<vector<double>> PathPlanner::update(double car_x, double car_y,
                                            double car_yaw,
-                                           double car_s,
-                                           double car_speed) {
-  // New path
-  vector<double> next_x_vals;
-  vector<double> next_y_vals;
+                                           double car_s, double car_d,
+                                           double car_v,
+                                           vector<double> previous_path_x,
+                                           vector<double> previous_path_y) {
+  // Create list of possible new states
+  vector<string> new_states = valid_states;
+  // Compute a trajectory for each new state
+  vector<vector<vector<double>>> candidate_trajectories;
+  vector<PathPlanner::Target> new_targets;
+  for (int s = 0; s < new_states.size(); s++) {
+    PathPlanner::Target new_target = _action(new_states[s]);
+    vector<vector<double>> candidate = _trajectory(car_x, car_y, car_yaw,
+                                        car_s, car_d, car_v,
+                                        previous_path_x, previous_path_y,
+                                        new_target.speed, new_target.lane);
+    new_targets.push_back(new_target);
+    candidate_trajectories.push_back(candidate);
+  }
+  // Compute a cost for each new trajectory
+  vector<double> costs;
+  for (int s = 0; s < new_states.size(); s++) {
+    costs.push_back(_cost(new_targets[s], candidate_trajectories[s]));
+  }
+  // Choose the trajectory with the lowest cost
+  double min_cost = 100.0;
+  int min_cost_index = 0;
+  for (int s = 0; s < new_states.size(); s++) {
+    if (costs[s] < min_cost) {
+      min_cost = costs[s];
+      min_cost_index = s;
+    }
+  }
+  cout << "Action: " << new_states[min_cost_index] << endl;
+  // Update target
+  target = new_targets[min_cost_index];
+  return candidate_trajectories[min_cost_index];
+}
 
-  double dist_inc = target_speed * dt;
-  for(int i = 0; i < (int)(_horizon / dt); i++)
-  {
-    double next_s = car_s + (i + 1) * dist_inc;
-    double next_d = 2 * (target_lane + 0.5); // Centre of target lane
-    vector<double> xy =  getXY(next_s, next_d, _map_waypoints_s, _map_waypoints_x, _map_waypoints_y);
-    next_x_vals.push_back(xy[0]);
-    next_y_vals.push_back(xy[1]);
+PathPlanner::Target PathPlanner::_action(string state) {
+  PathPlanner::Target new_target;
+  if (state == "KL") {
+    // Keep lane and speed
+    new_target = target;
+  } else if (state == "ACCEL") {
+    new_target = {target.speed + 0.1, target.lane};
+  } else if (state == "DECEL") {
+    new_target = {target.speed - 0.1, target.lane};
+  }
+  return new_target;
+}
+
+double PathPlanner::_cost(PathPlanner::Target new_target,
+                          vector<vector<double>> trajectory) {
+  // Cost function for candidate trajectory
+  return abs(new_target.speed - speed_limit);
+}
+
+vector<vector<double>> PathPlanner::_trajectory(double car_x, double car_y,
+                                   double car_yaw,
+                                   double car_s, double car_d, double car_v,
+                                   vector<double> previous_path_x,
+                                   vector<double> previous_path_y,
+                                   double new_speed, int new_lane) {
+  // Build a jerk free trajectory to the new lane and speed
+
+  // Initial conditons: estimate velocity and acceleration by finite differences
+  double x_i = car_x;
+  double y_i = car_y;
+  double x_i_dot, x_i_dotdot, y_i_dot, y_i_dotdot;
+  if (previous_path_x.size() < 3) {
+    // Probably just started, so velocity and acceleration are zero
+    x_i_dot = 0;
+    x_i_dotdot = 0;
+    y_i_dot = 0;
+    y_i_dotdot = 0;
+  } else {
+    x_i_dot = (previous_path_x[1] - previous_path_x[0]) / dt;
+    x_i_dotdot = (previous_path_x[2] - 2 * previous_path_x[1] + previous_path_x[0]) / (dt * dt);
+    y_i_dot = (previous_path_y[1] - previous_path_y[0]) / dt;
+    y_i_dotdot = (previous_path_y[2] - 2 * previous_path_y[1] + previous_path_y[0]) / (dt * dt);
+  }
+  // Final conditions (steady speed at centre of target lane)
+  double x_f_dotdot = 0;
+  double y_f_dotdot = 0;
+  cout << "Speeds: " << car_v << ", " << new_speed << endl;
+  vector<double> xy_f = getXY(car_s + new_speed * _horizon,
+                              new_lane * 4.0 + 2.0, _map_waypoints_s,
+                              _map_waypoints_x, _map_waypoints_y);
+  // Perturbed goal to estimate final heading
+  vector<double> xy_n = getXY(car_s + new_speed * _horizon + 10.0,
+                              new_lane * 4.0 + 2.0, _map_waypoints_s,
+                              _map_waypoints_x, _map_waypoints_y);
+  double yaw_f = atan2(xy_n[0] - xy_f[0], xy_n[1] - xy_f[1]);
+  double x_f = xy_f[0];
+  double y_f = xy_f[1];
+  double x_f_dot = new_speed * sin(yaw_f);
+  double y_f_dot = new_speed * cos(yaw_f);
+
+  VectorXd b = VectorXd(3);
+  // Solve for coefficients to compute x
+  b << x_f - (x_i + x_i_dot * _horizon + 0.5 * x_i_dotdot * pow(_horizon, 2)),
+       x_f_dot - (x_i_dot + x_i_dotdot * _horizon),
+       x_f_dotdot - x_i_dotdot;
+  VectorXd alpha_x = _A.colPivHouseholderQr().solve(b);
+  // Solve for coefficients to compute y
+  b << y_f - (y_i + y_i_dot * _horizon + 0.5 * y_i_dotdot * pow(_horizon, 2)),
+       y_f_dot - (y_i_dot + y_i_dotdot * _horizon),
+       y_f_dotdot - y_i_dotdot;
+  VectorXd alpha_y = _A.colPivHouseholderQr().solve(b);
+
+  // Now compute a trajectory of coordinates along this path
+  vector<double> next_x;
+  vector<double> next_y;
+  for (int i = 0; i < _horizon / dt; i++) {
+    double t = i * dt;
+    double x = x_i + x_i_dot * t + 0.5 * x_i_dotdot * pow(t, 2) +
+               alpha_x[0] * pow(t, 3) + alpha_x[1] * pow(t, 4) +
+               alpha_x[2] * pow(t, 5);
+    double y = y_i + y_i_dot * t + 0.5 * y_i_dotdot * pow(t, 2) +
+               alpha_y[0] * pow(t, 3) + alpha_y[1] * pow(t, 4) +
+               alpha_y[2] * pow(t, 5);
+    next_x.push_back(x);
+    next_y.push_back(y);
   }
 
-  return {next_x_vals, next_y_vals};
+  return {next_x, next_y};
 }
 
 

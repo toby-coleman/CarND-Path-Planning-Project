@@ -13,6 +13,10 @@ using Eigen::VectorXd;
 using namespace std;
 
 class PathPlanner {
+  struct Target {
+    double speed;
+    int lane;
+  };
 private:
   // Map
   vector<double> _map_waypoints_x, _map_waypoints_y, _map_waypoints_s;
@@ -21,19 +25,27 @@ private:
   // Matrix to use for computing paths
   MatrixXd _A = MatrixXd(3, 3);
 
+  // Converts a state into a new speed and lane
+  Target _action(string state);
   // Generates a candidate trajectory
-  vector<vector<double>> _trajectory(double speed, int lane);
+  vector<vector<double>> _trajectory(double car_x, double car_y, double car_yaw,
+                                     double car_s, double car_d, double car_v,
+                                     vector<double> previous_path_x,
+                                     vector<double> previous_path_y,
+                                     double new_speed, int new_lane);
+  // Cost function
+  double _cost(Target new_target, vector<vector<double>> trajectory);
 public:
-  // Target speed
-  double target_speed = 22.3;
-  // Target lane
-  int target_lane = 0;
+  // Speed limit
+  double speed_limit = 48 * 0.44704; // 50 mph
+  // Target speed and lane
+  Target target = {0.0, 1};
   // Timestep
   double dt = 0.02;
   // Valid states
   vector<string> valid_states = {"KL", "ACCEL", "DECEL"};
   // Car state
-  double car_x, car_y, car_yaw, car_speed;
+  string car_state = "KL";
 
   // Constructor
   PathPlanner(vector<double> map_waypoints_x,
@@ -43,7 +55,11 @@ public:
 
   // Call this to plan the path and return a trajectory
   vector<vector<double>> update(double car_x, double car_y,
-    double car_yaw, double car_s, double car_speed);
+                                double car_yaw,
+                                double car_s, double car_d,
+                                double car_v,
+                                vector<double> previous_path_x,
+                                vector<double> previous_path_y);
 };
 
 
