@@ -69,7 +69,9 @@ int main() {
 
   // Path planner with 1 second horizon
   PathPlanner plan = PathPlanner(map_waypoints_x, map_waypoints_y,
-                                 map_waypoints_s, 1.0);
+                                 map_waypoints_s, 2.0);
+ plan.target.lane = 1;    // Car starts in lane 1
+ plan.target.speed = 2.0;  // Initialise with a forward motion target
 
   h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&plan](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
@@ -96,9 +98,7 @@ int main() {
           	double car_s = j[1]["s"];
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
-            // Convert mph to m/s
           	double car_speed = j[1]["speed"];
-            car_speed *= 0.44704;
 
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
@@ -113,11 +113,11 @@ int main() {
           	json msgJson;
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-            plan.target.lane = 1;
             vector<vector<double>> t = plan.update(car_x, car_y, car_yaw,
                                                    car_s, car_d, car_speed,
                                                    previous_path_x,
-                                                   previous_path_y);
+                                                   previous_path_y,
+                                                   sensor_fusion);
 
           	msgJson["next_x"] = t[0];
           	msgJson["next_y"] = t[1];

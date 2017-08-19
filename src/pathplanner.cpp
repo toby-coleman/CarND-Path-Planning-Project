@@ -30,22 +30,32 @@ PathPlanner::PathPlanner(vector<double> map_waypoints_x,
         6 * T, 12 * T2, 20 * T3;
 }
 
-vector<vector<double>> PathPlanner::update(double car_x, double car_y,
-                                           double car_yaw,
-                                           double car_s, double car_d,
-                                           double car_v,
-                                           vector<double> previous_path_x,
-                                           vector<double> previous_path_y) {
+vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
+                                        double car_yaw_,
+                                        double car_s_, double car_d_,
+                                        double car_v_,
+                                        vector<double> previous_path_x,
+                                        vector<double> previous_path_y,
+                                        vector<vector<double>> sensor_fusion) {
+  // Store car's current position, yaw, speed
+  car_x = car_x_;
+  car_y = car_y_;
+  car_yaw = car_yaw_;
+  car_s = car_s_;
+  car_d = car_d_;
+  car_v = car_v_ * 0.44704; // Convert to mph
+  // Predict where all of the other cars will go
+  vector<vector<vector<double>>> predictions = _predict(sensor_fusion);
+
   // Create list of possible new states
-  vector<string> new_states = valid_states;
+  vector<string> new_states = valid_states();
   // Compute a trajectory for each new state
   vector<vector<vector<double>>> candidate_trajectories;
   vector<PathPlanner::Target> new_targets;
   for (int s = 0; s < new_states.size(); s++) {
     PathPlanner::Target new_target = _action(new_states[s]);
-    vector<vector<double>> candidate = _trajectory(car_x, car_y, car_yaw,
-                                        car_s, car_d, car_v,
-                                        previous_path_x, previous_path_y,
+    vector<vector<double>> candidate = _trajectory(previous_path_x,
+                                        previous_path_y,
                                         new_target.speed, new_target.lane);
     new_targets.push_back(new_target);
     candidate_trajectories.push_back(candidate);
@@ -53,20 +63,30 @@ vector<vector<double>> PathPlanner::update(double car_x, double car_y,
   // Compute a cost for each new trajectory
   vector<double> costs;
   for (int s = 0; s < new_states.size(); s++) {
-    costs.push_back(_cost(new_targets[s], candidate_trajectories[s]));
+    costs.push_back(_cost(new_targets[s],
+                    candidate_trajectories[s], predictions));
   }
   // Choose the trajectory with the lowest cost
-  double min_cost = 100.0;
+  double min_cost = 1000000.0;
   int min_cost_index = 0;
   for (int s = 0; s < new_states.size(); s++) {
+    cout.precision(4);
+    cout << new_states[s] << ": " << costs[s] << ", ";
     if (costs[s] < min_cost) {
       min_cost = costs[s];
       min_cost_index = s;
     }
   }
+  cout << "                     " << endl;
   cout << "Action: " << new_states[min_cost_index] << endl;
   // Update target
   target = new_targets[min_cost_index];
+  cout << "Target speed: " << target.speed << ", lane: " << target.lane << endl;
+  // Update state
+  car_state = new_states[min_cost_index];
+
+  // Move the console back up a few lines
+  cout << "\e[A\e[A\e[A";
   return candidate_trajectories[min_cost_index];
 }
 
@@ -79,20 +99,70 @@ PathPlanner::Target PathPlanner::_action(string state) {
     new_target = {target.speed + 0.1, target.lane};
   } else if (state == "DECEL") {
     new_target = {target.speed - 0.1, target.lane};
+  } else if (state == "LEFT") {
+    new_target = {target.speed, target.lane - 1};
+  } else if (state == "RIGHT") {
+    new_target = {target.speed, target.lane + 1};
   }
   return new_target;
 }
 
-double PathPlanner::_cost(PathPlanner::Target new_target,
-                          vector<vector<double>> trajectory) {
-  // Cost function for candidate trajectory
-  return abs(new_target.speed - speed_limit);
+vector<string> PathPlanner::valid_states() {
+  // Returns valid actions
+  vector<string> valid = _all_states;
+  if (car_state == "ACCEL") {
+    // Remove DECEL
+    valid.erase(remove(valid.begin(), valid.end(), "DECEL"), valid.end());
+  } else if (car_state == "DECEL") {
+    // Remove ACCEL
+    valid.erase(remove(valid.begin(), valid.end(), "ACCEL"), valid.end());
+  }
+  if (target.lane == 0) {
+    // Remove LEFT (already in left-most lane)
+    valid.erase(remove(valid.begin(), valid.end(), "LEFT"), valid.end());
+  } else if (target.lane == 2) {
+    // Remove RIGHT (already in left-most lane)
+    valid.erase(remove(valid.begin(), valid.end(), "RIGHT"), valid.end());
+  }
+
+  return valid;
 }
 
-vector<vector<double>> PathPlanner::_trajectory(double car_x, double car_y,
-                                   double car_yaw,
-                                   double car_s, double car_d, double car_v,
-                                   vector<double> previous_path_x,
+double PathPlanner::_cost(PathPlanner::Target new_target,
+                          vector<vector<double>> trajectory,
+                          vector<vector<vector<double>>> predictions) {
+  // Cost function for candidate trajectory
+  double cost = 0;
+
+  double s_f = getFrenet(trajectory[0].back(), trajectory[1].back(),
+                         car_yaw, _map_waypoints_x, _map_waypoints_y)[0];
+
+    for (int i = 1; i < trajectory[0].size(); i++) {
+    // Compute speed
+    double speed = distance(trajectory[0][i], trajectory[1][i],
+                            trajectory[0][i - 1], trajectory[1][i - 1]) / dt;
+    // Make speeds in the wrong direction negative
+    if (s_f < car_s) {
+      speed = -speed;
+    }
+    // Low speed
+    cost += 0.1 * sigmoid(5.0 - speed);
+    // High speed
+    cost += sigmoid(10 * (speed - speed_limit + 1.0));
+  }
+  // Closest vehicles (penalise collisions)
+  vector<double> closest_sd = _closest_car(trajectory, predictions);
+  cost += trajectory.size() * (5.0 * sigmoid(6.0 - closest_sd[0]) +
+                               20.0 * sigmoid(10 * (2.5 - closest_sd[0])));
+  cost += 10 * trajectory.size() * sigmoid(20 * (2.0 - closest_sd[0]));
+  // Lane change penalty
+  if (target.lane != new_target.lane) {
+    cost += 10;
+  }
+  return cost;
+}
+
+vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
                                    vector<double> previous_path_y,
                                    double new_speed, int new_lane) {
   // Build a jerk free trajectory to the new lane and speed
@@ -116,12 +186,11 @@ vector<vector<double>> PathPlanner::_trajectory(double car_x, double car_y,
   // Final conditions (steady speed at centre of target lane)
   double x_f_dotdot = 0;
   double y_f_dotdot = 0;
-  cout << "Speeds: " << car_v << ", " << new_speed << endl;
-  vector<double> xy_f = getXY(car_s + new_speed * _horizon,
+  vector<double> xy_f = getXY(car_s + 0.5 * (new_speed + car_v) * _horizon,
                               new_lane * 4.0 + 2.0, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   // Perturbed goal to estimate final heading
-  vector<double> xy_n = getXY(car_s + new_speed * _horizon + 10.0,
+  vector<double> xy_n = getXY(car_s + 0.5 * (new_speed + car_v) * _horizon + 10.0,
                               new_lane * 4.0 + 2.0, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   double yaw_f = atan2(xy_n[0] - xy_f[0], xy_n[1] - xy_f[1]);
@@ -160,6 +229,75 @@ vector<vector<double>> PathPlanner::_trajectory(double car_x, double car_y,
   return {next_x, next_y};
 }
 
+vector<vector<vector<double>>> PathPlanner::_predict(
+                                      vector<vector<double>> sensor_fusion) {
+  // Predict the trajectories of all other vehicles, assuming they move at
+  // constant velocity
+
+  vector<vector<vector<double>>> predictions;
+
+  // Loop over each vehicle in sensor fusion data
+  for (int v = 0; v < sensor_fusion.size(); v++) {
+    double x = sensor_fusion[v][1];
+    double y = sensor_fusion[v][2];
+    double vx = sensor_fusion[v][3];
+    double vy = sensor_fusion[v][4];
+    vector<double> next_x;
+    vector<double> next_y;
+    // Make a prediction
+    for (int i = 0; i < _horizon / dt; i++) {
+      double t = i * dt;
+      next_x.push_back(x + vx * t);
+      next_y.push_back(y + vy * t);
+    }
+    predictions.push_back({next_x, next_y});
+  }
+
+  return predictions;
+}
+
+vector<double> PathPlanner::_closest_car(vector<vector<double>> trajectory,
+                                 vector<vector<vector<double>>> predictions) {
+  // Compute distance to the other vehicles along the trajectory and return
+  // the closest s and d values
+  double closest_s = 10000; // large number
+  double closest_d = 10000; // large number
+
+  // Compute heading of the other vehicles
+  vector<double> headings;
+  for (int v = 0; v < predictions.size(); v++) {
+    double heading = atan2(predictions[v][0][1] - predictions[v][0][0],
+                           predictions[v][1][1] - predictions[v][1][0]);
+    headings.push_back(heading);
+  }
+  // Loop over time
+  for (int i = 0; i < trajectory[0].size(); i++) {
+    // Our car location
+    double x = trajectory[0][i];
+    double y = trajectory[1][i];
+    vector<double> sd = getFrenet(x, y,
+                                  car_yaw, _map_waypoints_x, _map_waypoints_y);
+    // Loop over other vehicles
+    for (int v = 0; v < predictions.size(); v++) {
+      double other_x = predictions[v][0][i];
+      double other_y = predictions[v][1][i];
+      vector<double> other_sd = getFrenet(other_x, other_y,
+                              headings[v], _map_waypoints_x, _map_waypoints_y);
+      // Save closest pass in s and d directions
+      if ((abs(other_sd[0] - sd[0]) < closest_s) &&
+          (abs(other_sd[1] - sd[1]) < 1.0)) {
+        // Closest s distance for cars in the same lane
+        closest_s = abs(other_sd[0] - sd[0]);
+      }
+      if ((abs(other_sd[1] - sd[1]) < closest_d) &&
+          (abs(other_sd[0] - sd[0]) < 5.0)) {
+        // Closest d distance for cars alongside us (nearby in s)
+        closest_d = abs(other_sd[1] - sd[1]);
+      }
+    }
+  }
+  return {closest_s, closest_d};
+}
 
 // Utility functions copied from main.cpp template
 
@@ -216,7 +354,7 @@ int NextWaypoint(double x, double y, double theta,
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
 vector<double> getFrenet(double x, double y, double theta,
                          vector<double> maps_x, vector<double> maps_y) {
-	int next_wp = NextWaypoint(x,y, theta, maps_x,maps_y);
+	int next_wp = NextWaypoint(x,y, theta, maps_x, maps_y);
 
 	int prev_wp;
 	prev_wp = next_wp - 1;
@@ -287,4 +425,8 @@ vector<double> getXY(double s, double d, vector<double> maps_s,
 	double y = seg_y + d * sin(perp_heading);
 
 	return {x,y};
+}
+
+double sigmoid(double x) {
+  return 1.0 / (1.0 + exp(-x));
 }
