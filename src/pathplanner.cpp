@@ -20,7 +20,7 @@ PathPlanner::PathPlanner(vector<double> map_waypoints_x,
   _horizon = horizon;
 
   // Matrix used of calculation of jerk free paths
-  double T = _horizon;
+  double T = _t_manoeuvre;
   double T2 = T * T;
   double T3 = T2 * T;
   double T4 = T3 * T;
@@ -150,14 +150,16 @@ double PathPlanner::_cost(PathPlanner::Target new_target,
     // High speed
     cost += sigmoid(10 * (speed - speed_limit + 1.0));
   }
-  // Closest vehicles (penalise collisions)
+  // Closest vehicles (avoid collisions and keep following distance)
   vector<double> closest_sd = _closest_car(trajectory, predictions);
   cost += trajectory.size() * (5.0 * sigmoid(6.0 - closest_sd[0]) +
                                20.0 * sigmoid(10 * (2.5 - closest_sd[0])));
   cost += 10 * trajectory.size() * sigmoid(20 * (2.0 - closest_sd[0]));
+  // Use cartesian distance to penalise collisions
+  cost += 100 * sigmoid(15 * (3.0 - closest_sd[2]));
   // Lane change penalty
   if (target.lane != new_target.lane) {
-    cost += 10;
+    cost += 20;
   }
   return cost;
 }
@@ -186,11 +188,11 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
   // Final conditions (steady speed at centre of target lane)
   double x_f_dotdot = 0;
   double y_f_dotdot = 0;
-  vector<double> xy_f = getXY(car_s + 0.5 * (new_speed + car_v) * _horizon,
+  vector<double> xy_f = getXY(car_s + new_speed * _t_manoeuvre,
                               new_lane * 4.0 + 2.0, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   // Perturbed goal to estimate final heading
-  vector<double> xy_n = getXY(car_s + 0.5 * (new_speed + car_v) * _horizon + 10.0,
+  vector<double> xy_n = getXY(car_s + new_speed * _t_manoeuvre + 10.0,
                               new_lane * 4.0 + 2.0, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   double yaw_f = atan2(xy_n[0] - xy_f[0], xy_n[1] - xy_f[1]);
@@ -201,13 +203,13 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
 
   VectorXd b = VectorXd(3);
   // Solve for coefficients to compute x
-  b << x_f - (x_i + x_i_dot * _horizon + 0.5 * x_i_dotdot * pow(_horizon, 2)),
-       x_f_dot - (x_i_dot + x_i_dotdot * _horizon),
+  b << x_f - (x_i + x_i_dot * _t_manoeuvre + 0.5 * x_i_dotdot * pow(_t_manoeuvre, 2)),
+       x_f_dot - (x_i_dot + x_i_dotdot * _t_manoeuvre),
        x_f_dotdot - x_i_dotdot;
   VectorXd alpha_x = _A.colPivHouseholderQr().solve(b);
   // Solve for coefficients to compute y
-  b << y_f - (y_i + y_i_dot * _horizon + 0.5 * y_i_dotdot * pow(_horizon, 2)),
-       y_f_dot - (y_i_dot + y_i_dotdot * _horizon),
+  b << y_f - (y_i + y_i_dot * _t_manoeuvre + 0.5 * y_i_dotdot * pow(_t_manoeuvre, 2)),
+       y_f_dot - (y_i_dot + y_i_dotdot * _t_manoeuvre),
        y_f_dotdot - y_i_dotdot;
   VectorXd alpha_y = _A.colPivHouseholderQr().solve(b);
 
@@ -259,9 +261,10 @@ vector<vector<vector<double>>> PathPlanner::_predict(
 vector<double> PathPlanner::_closest_car(vector<vector<double>> trajectory,
                                  vector<vector<vector<double>>> predictions) {
   // Compute distance to the other vehicles along the trajectory and return
-  // the closest s and d values
+  // the closest s and d values, along with closest cartiesian distance
   double closest_s = 10000; // large number
-  double closest_d = 10000; // large number
+  double closest_d = 10000;
+  double closest = 10000;
 
   // Compute heading of the other vehicles
   vector<double> headings;
@@ -281,6 +284,7 @@ vector<double> PathPlanner::_closest_car(vector<vector<double>> trajectory,
     for (int v = 0; v < predictions.size(); v++) {
       double other_x = predictions[v][0][i];
       double other_y = predictions[v][1][i];
+      double dist = distance(x, y, other_x, other_y);
       vector<double> other_sd = getFrenet(other_x, other_y,
                               headings[v], _map_waypoints_x, _map_waypoints_y);
       // Save closest pass in s and d directions
@@ -294,9 +298,13 @@ vector<double> PathPlanner::_closest_car(vector<vector<double>> trajectory,
         // Closest d distance for cars alongside us (nearby in s)
         closest_d = abs(other_sd[1] - sd[1]);
       }
+      if (dist < closest) {
+        // Closest cartesian distance
+        closest = dist;
+      }
     }
   }
-  return {closest_s, closest_d};
+  return {closest_s, closest_d, closest};
 }
 
 // Utility functions copied from main.cpp template

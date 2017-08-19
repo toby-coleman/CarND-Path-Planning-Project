@@ -20,8 +20,10 @@ class PathPlanner {
 private:
   // Map
   vector<double> _map_waypoints_x, _map_waypoints_y, _map_waypoints_s;
-  // Horizon (time into the future for each path)
+  // Horizon (how far the points should be mapped into the future)
   double _horizon;
+  // Manoeuvring time (used for path planning)
+  double _t_manoeuvre = 1.5;
   // Matrix to use for computing paths
   MatrixXd _A = MatrixXd(3, 3);
   // All possible states
@@ -38,7 +40,7 @@ private:
                vector<vector<vector<double>>> predictions);
   // Predict function
   vector<vector<vector<double>>> _predict(vector<vector<double>> sensor_fusion);
-  // Closest car distance (s and d)
+  // Closest car distance {s, d, cartesian}
   vector<double> _closest_car(vector<vector<double>> trajectory,
                               vector<vector<vector<double>>> predictions);
 public:

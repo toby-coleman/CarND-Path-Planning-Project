@@ -69,7 +69,7 @@ int main() {
 
   // Path planner with 1 second horizon
   PathPlanner plan = PathPlanner(map_waypoints_x, map_waypoints_y,
-                                 map_waypoints_s, 2.0);
+                                 map_waypoints_s, 1.0);
  plan.target.lane = 1;    // Car starts in lane 1
  plan.target.speed = 2.0;  // Initialise with a forward motion target
 
