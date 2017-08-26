@@ -5,6 +5,7 @@
 #include <string>
 #include <map>
 #include <math.h>
+#include "spline.h"
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 
@@ -23,14 +24,21 @@ private:
   // Horizon (how far the points should be mapped into the future)
   double _horizon;
   // Manoeuvring time (used for path planning)
-  double _t_manoeuvre = 1.5;
+  double _t_manoeuvre = 1.0;
   // Matrix to use for computing paths
   MatrixXd _A = MatrixXd(3, 3);
+  // Solve (can be re-used for speed)
+  Eigen::ColPivHouseholderQR<MatrixXd> _solver;
   // All possible states
   vector<string> _all_states = {"KL", "ACCEL", "DECEL", "LEFT", "RIGHT"};
 
   // Converts a state into a new speed and lane
   Target _action(string state);
+  // Computes trajectory coefficients
+  vector<double> _alpha(double x_i, double x_i_dot, double x_i_dotdot,
+                        double x_f, double x_f_dot, double x_f_dotdot);
+  // Summed squared acceleration from trajectory
+  double _squared_accel(vector<double> alpha_x, vector<double> alpha_y);
   // Generates a candidate trajectory
   vector<vector<double>> _trajectory(vector<double> previous_path_x,
                                      vector<double> previous_path_y,

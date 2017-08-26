@@ -28,6 +28,7 @@ PathPlanner::PathPlanner(vector<double> map_waypoints_x,
   _A << T3, T4, T5,
         3 * T2, 4 * T3, 5 * T4,
         6 * T, 12 * T2, 20 * T3;
+  _solver = _A.colPivHouseholderQr();
 }
 
 vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
@@ -77,7 +78,7 @@ vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
       min_cost_index = s;
     }
   }
-  cout << "                     " << endl;
+  cout << endl;
   cout << "Action: " << new_states[min_cost_index] << endl;
   // Update target
   target = new_targets[min_cost_index];
@@ -85,8 +86,6 @@ vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
   // Update state
   car_state = new_states[min_cost_index];
 
-  // Move the console back up a few lines
-  cout << "\e[A\e[A\e[A";
   return candidate_trajectories[min_cost_index];
 }
 
@@ -164,6 +163,38 @@ double PathPlanner::_cost(PathPlanner::Target new_target,
   return cost;
 }
 
+vector<double> PathPlanner::_alpha(double x_i, double x_i_dot,
+                                   double x_i_dotdot, double x_f,
+                                   double x_f_dot, double x_f_dotdot) {
+  // Solves Ax = b to return alpha coefficients for path
+  VectorXd b = VectorXd(3);
+  // Solve for coefficients to compute x
+  b << x_f - (x_i + x_i_dot * _t_manoeuvre + 0.5 * x_i_dotdot * pow(_t_manoeuvre, 2)),
+       x_f_dot - (x_i_dot + x_i_dotdot * _t_manoeuvre),
+       x_f_dotdot - x_i_dotdot;
+  VectorXd a = _solver.solve(b);
+
+  return {x_i, x_i_dot, 0.5 * x_i_dotdot, a[0], a[1], a[2]};
+}
+
+double PathPlanner::_squared_accel(vector<double> alpha_x,
+                                   vector<double> alpha_y) {
+  // Compute summed squared acceleration from path coefficients
+  double sum = 0;
+  // Recover initial acceleration from alpha[2]
+  double x_i_dotdot = 2 * alpha_x[2];
+  double y_i_dotdot = 2 * alpha_y[2];
+  // Loop over time
+  for (int i = 0; i < _horizon / dt; i++) {
+    double t = i * dt;
+    sum += pow(x_i_dotdot + 6 * alpha_x[3] * t + 12 * alpha_x[4] * pow(t, 2) +
+           20 * alpha_x[5] * pow(t, 3), 2);
+    sum += pow(y_i_dotdot + 6 * alpha_y[3] * t + 12 * alpha_y[4] * pow(t, 2) +
+           20 * alpha_y[5] * pow(t, 3), 2);
+  }
+  return sum;
+}
+
 vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
                                    vector<double> previous_path_y,
                                    double new_speed, int new_lane) {
@@ -188,30 +219,61 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
   // Final conditions (steady speed at centre of target lane)
   double x_f_dotdot = 0;
   double y_f_dotdot = 0;
+  // Don't move d-position too quickly where it is now
+  double d_target = new_lane * 4.0 + 2.0;
+  double d_new = 0.2 * (d_target - car_d) + car_d;
+  cout << "d_target: " << d_target << ", d_last " << car_d << ", "  << d_new << endl;
   vector<double> xy_f = getXY(car_s + new_speed * _t_manoeuvre,
-                              new_lane * 4.0 + 2.0, _map_waypoints_s,
+                              d_new, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   // Perturbed goal to estimate final heading
   vector<double> xy_n = getXY(car_s + new_speed * _t_manoeuvre + 10.0,
-                              new_lane * 4.0 + 2.0, _map_waypoints_s,
+                              d_new, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   double yaw_f = atan2(xy_n[0] - xy_f[0], xy_n[1] - xy_f[1]);
-  double x_f = xy_f[0];
-  double y_f = xy_f[1];
   double x_f_dot = new_speed * sin(yaw_f);
   double y_f_dot = new_speed * cos(yaw_f);
 
-  VectorXd b = VectorXd(3);
+  /*// Fit a quadratic to different squared accelerations
+  VectorXd s_f = VectorXd(3);
+  // Guess future position and take +/-5% either side
+  s_f(0) = car_s + 0.95 * new_speed * _t_manoeuvre;
+  s_f(1) = car_s + new_speed * _t_manoeuvre;
+  s_f(2) = car_s + 1.05 * new_speed * _t_manoeuvre;
+  // Compute summed squared acceleration at these guesses
+  VectorXd sq_accel = VectorXd(3);
+  for (int i = 0; i < 3; i++) {
+    xy_f = getXY(s_f(i),
+                 new_lane * 4.0 + 2.0, _map_waypoints_s,
+                 _map_waypoints_x, _map_waypoints_y);
+    sq_accel(i) = _squared_accel(_alpha(x_i, x_i_dot, x_i_dotdot,
+                                        xy_f[0], x_f_dot, x_f_dotdot),
+                                _alpha(y_i, y_i_dot, y_i_dotdot,
+                                        xy_f[1], y_f_dot, y_f_dotdot));
+  }
+  // Build matrix to do quadratic fit
+  MatrixXd A = MatrixXd(3, 3);
+  A << pow(s_f(0), 2), s_f(0), 1,
+       pow(s_f(1), 2), s_f(1), 1,
+       pow(s_f(2), 2), s_f(2), 1;
+  // Solve to get quadratic coefficients
+  VectorXd coeff = A.colPivHouseholderQr().solve(sq_accel);
+  // Take minimum of this quadratic to minimise acceleration magnitude
+  double s_f_best = max(min(s_f(2), - coeff(1) / (2 * coeff(0))), s_f(0));
+  cout << "Accels: " << s_f(0) << ", " << s_f(1) << ", " << s_f(2) << endl;
+  cout << "Guess s_f: " << s_f(1) << " best s_f: " << s_f_best << endl;
+  xy_f = getXY(s_f_best,
+               new_lane * 4.0 + 2.0, _map_waypoints_s,
+               _map_waypoints_x, _map_waypoints_y);*/
+  double x_f = xy_f[0];
+  double y_f = xy_f[1];
+
   // Solve for coefficients to compute x
-  b << x_f - (x_i + x_i_dot * _t_manoeuvre + 0.5 * x_i_dotdot * pow(_t_manoeuvre, 2)),
-       x_f_dot - (x_i_dot + x_i_dotdot * _t_manoeuvre),
-       x_f_dotdot - x_i_dotdot;
-  VectorXd alpha_x = _A.colPivHouseholderQr().solve(b);
+  vector<double> alpha_x = _alpha(x_i, x_i_dot, x_i_dotdot,
+                            x_f, x_f_dot, x_f_dotdot);
   // Solve for coefficients to compute y
-  b << y_f - (y_i + y_i_dot * _t_manoeuvre + 0.5 * y_i_dotdot * pow(_t_manoeuvre, 2)),
-       y_f_dot - (y_i_dot + y_i_dotdot * _t_manoeuvre),
-       y_f_dotdot - y_i_dotdot;
-  VectorXd alpha_y = _A.colPivHouseholderQr().solve(b);
+  vector<double> alpha_y = _alpha(y_i, y_i_dot, y_i_dotdot,
+                            y_f, y_f_dot, y_f_dotdot);
 
   // Now compute a trajectory of coordinates along this path
   vector<double> next_x;
@@ -219,11 +281,11 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
   for (int i = 0; i < _horizon / dt; i++) {
     double t = i * dt;
     double x = x_i + x_i_dot * t + 0.5 * x_i_dotdot * pow(t, 2) +
-               alpha_x[0] * pow(t, 3) + alpha_x[1] * pow(t, 4) +
-               alpha_x[2] * pow(t, 5);
+               alpha_x[3] * pow(t, 3) + alpha_x[4] * pow(t, 4) +
+               alpha_x[5] * pow(t, 5);
     double y = y_i + y_i_dot * t + 0.5 * y_i_dotdot * pow(t, 2) +
-               alpha_y[0] * pow(t, 3) + alpha_y[1] * pow(t, 4) +
-               alpha_y[2] * pow(t, 5);
+               alpha_y[3] * pow(t, 3) + alpha_y[4] * pow(t, 4) +
+               alpha_y[5] * pow(t, 5);
     next_x.push_back(x);
     next_y.push_back(y);
   }
