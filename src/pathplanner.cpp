@@ -18,17 +18,6 @@ PathPlanner::PathPlanner(vector<double> map_waypoints_x,
   _map_waypoints_y = map_waypoints_y;
   _map_waypoints_s = map_waypoints_s;
   _horizon = horizon;
-
-  // Matrix used of calculation of jerk free paths
-  double T = _t_manoeuvre;
-  double T2 = T * T;
-  double T3 = T2 * T;
-  double T4 = T3 * T;
-  double T5 = T4 * T;
-  _A << T3, T4, T5,
-        3 * T2, 4 * T3, 5 * T4,
-        6 * T, 12 * T2, 20 * T3;
-  _solver = _A.colPivHouseholderQr();
 }
 
 vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
@@ -41,7 +30,7 @@ vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
   // Store car's current position, yaw, speed
   car_x = car_x_;
   car_y = car_y_;
-  car_yaw = car_yaw_;
+  car_yaw = deg2rad(car_yaw_);
   car_s = car_s_;
   car_d = car_d_;
   car_v = car_v_ * 0.44704; // Convert to mph
@@ -80,6 +69,11 @@ vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
   }
   cout << endl;
   cout << "Action: " << new_states[min_cost_index] << endl;
+  // Print info on closest car under this trajectory
+  vector<double> close = _closest_car(candidate_trajectories[min_cost_index],
+                                      predictions);
+  cout << "Closest obstacles in [s, d, cartesian]: " << close[0] << ", "
+       << close[1] << ", " << close[2] << endl;
   // Update target
   target = new_targets[min_cost_index];
   cout << "Target speed: " << target.speed << ", lane: " << target.lane << endl;
@@ -152,142 +146,86 @@ double PathPlanner::_cost(PathPlanner::Target new_target,
   // Closest vehicles (avoid collisions and keep following distance)
   vector<double> closest_sd = _closest_car(trajectory, predictions);
   cost += trajectory.size() * (5.0 * sigmoid(6.0 - closest_sd[0]) +
-                               20.0 * sigmoid(10 * (2.5 - closest_sd[0])));
-  cost += 10 * trajectory.size() * sigmoid(20 * (2.0 - closest_sd[0]));
+                               50.0 * sigmoid(10 * (2.5 - closest_sd[0])));
+  cost += 30 * trajectory.size() * sigmoid(20 * (2.0 - closest_sd[1]));
   // Use cartesian distance to penalise collisions
-  cost += 100 * sigmoid(15 * (3.0 - closest_sd[2]));
+  cost += 1000 * sigmoid(15 * (2.5 - closest_sd[2]));
   // Lane change penalty
   if (target.lane != new_target.lane) {
-    cost += 20;
+    cost += 50;
   }
   return cost;
-}
-
-vector<double> PathPlanner::_alpha(double x_i, double x_i_dot,
-                                   double x_i_dotdot, double x_f,
-                                   double x_f_dot, double x_f_dotdot) {
-  // Solves Ax = b to return alpha coefficients for path
-  VectorXd b = VectorXd(3);
-  // Solve for coefficients to compute x
-  b << x_f - (x_i + x_i_dot * _t_manoeuvre + 0.5 * x_i_dotdot * pow(_t_manoeuvre, 2)),
-       x_f_dot - (x_i_dot + x_i_dotdot * _t_manoeuvre),
-       x_f_dotdot - x_i_dotdot;
-  VectorXd a = _solver.solve(b);
-
-  return {x_i, x_i_dot, 0.5 * x_i_dotdot, a[0], a[1], a[2]};
-}
-
-double PathPlanner::_squared_accel(vector<double> alpha_x,
-                                   vector<double> alpha_y) {
-  // Compute summed squared acceleration from path coefficients
-  double sum = 0;
-  // Recover initial acceleration from alpha[2]
-  double x_i_dotdot = 2 * alpha_x[2];
-  double y_i_dotdot = 2 * alpha_y[2];
-  // Loop over time
-  for (int i = 0; i < _horizon / dt; i++) {
-    double t = i * dt;
-    sum += pow(x_i_dotdot + 6 * alpha_x[3] * t + 12 * alpha_x[4] * pow(t, 2) +
-           20 * alpha_x[5] * pow(t, 3), 2);
-    sum += pow(y_i_dotdot + 6 * alpha_y[3] * t + 12 * alpha_y[4] * pow(t, 2) +
-           20 * alpha_y[5] * pow(t, 3), 2);
-  }
-  return sum;
 }
 
 vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
                                    vector<double> previous_path_y,
                                    double new_speed, int new_lane) {
-  // Build a jerk free trajectory to the new lane and speed
+  // Build a spline trajectory to the new lane and speed
 
-  // Initial conditons: estimate velocity and acceleration by finite differences
-  double x_i = car_x;
-  double y_i = car_y;
-  double x_i_dot, x_i_dotdot, y_i_dot, y_i_dotdot;
-  if (previous_path_x.size() < 3) {
-    // Probably just started, so velocity and acceleration are zero
-    x_i_dot = 0;
-    x_i_dotdot = 0;
-    y_i_dot = 0;
-    y_i_dotdot = 0;
-  } else {
-    x_i_dot = (previous_path_x[1] - previous_path_x[0]) / dt;
-    x_i_dotdot = (previous_path_x[2] - 2 * previous_path_x[1] + previous_path_x[0]) / (dt * dt);
-    y_i_dot = (previous_path_y[1] - previous_path_y[0]) / dt;
-    y_i_dotdot = (previous_path_y[2] - 2 * previous_path_y[1] + previous_path_y[0]) / (dt * dt);
-  }
-  // Final conditions (steady speed at centre of target lane)
-  double x_f_dotdot = 0;
-  double y_f_dotdot = 0;
-  // Don't move d-position too quickly where it is now
-  double d_target = new_lane * 4.0 + 2.0;
-  double d_new = 0.2 * (d_target - car_d) + car_d;
-  cout << "d_target: " << d_target << ", d_last " << car_d << ", "  << d_new << endl;
-  vector<double> xy_f = getXY(car_s + new_speed * _t_manoeuvre,
-                              d_new, _map_waypoints_s,
-                              _map_waypoints_x, _map_waypoints_y);
-  // Perturbed goal to estimate final heading
-  vector<double> xy_n = getXY(car_s + new_speed * _t_manoeuvre + 10.0,
-                              d_new, _map_waypoints_s,
-                              _map_waypoints_x, _map_waypoints_y);
-  double yaw_f = atan2(xy_n[0] - xy_f[0], xy_n[1] - xy_f[1]);
-  double x_f_dot = new_speed * sin(yaw_f);
-  double y_f_dot = new_speed * cos(yaw_f);
-
-  /*// Fit a quadratic to different squared accelerations
-  VectorXd s_f = VectorXd(3);
-  // Guess future position and take +/-5% either side
-  s_f(0) = car_s + 0.95 * new_speed * _t_manoeuvre;
-  s_f(1) = car_s + new_speed * _t_manoeuvre;
-  s_f(2) = car_s + 1.05 * new_speed * _t_manoeuvre;
-  // Compute summed squared acceleration at these guesses
-  VectorXd sq_accel = VectorXd(3);
-  for (int i = 0; i < 3; i++) {
-    xy_f = getXY(s_f(i),
-                 new_lane * 4.0 + 2.0, _map_waypoints_s,
-                 _map_waypoints_x, _map_waypoints_y);
-    sq_accel(i) = _squared_accel(_alpha(x_i, x_i_dot, x_i_dotdot,
-                                        xy_f[0], x_f_dot, x_f_dotdot),
-                                _alpha(y_i, y_i_dot, y_i_dotdot,
-                                        xy_f[1], y_f_dot, y_f_dotdot));
-  }
-  // Build matrix to do quadratic fit
-  MatrixXd A = MatrixXd(3, 3);
-  A << pow(s_f(0), 2), s_f(0), 1,
-       pow(s_f(1), 2), s_f(1), 1,
-       pow(s_f(2), 2), s_f(2), 1;
-  // Solve to get quadratic coefficients
-  VectorXd coeff = A.colPivHouseholderQr().solve(sq_accel);
-  // Take minimum of this quadratic to minimise acceleration magnitude
-  double s_f_best = max(min(s_f(2), - coeff(1) / (2 * coeff(0))), s_f(0));
-  cout << "Accels: " << s_f(0) << ", " << s_f(1) << ", " << s_f(2) << endl;
-  cout << "Guess s_f: " << s_f(1) << " best s_f: " << s_f_best << endl;
-  xy_f = getXY(s_f_best,
-               new_lane * 4.0 + 2.0, _map_waypoints_s,
-               _map_waypoints_x, _map_waypoints_y);*/
-  double x_f = xy_f[0];
-  double y_f = xy_f[1];
-
-  // Solve for coefficients to compute x
-  vector<double> alpha_x = _alpha(x_i, x_i_dot, x_i_dotdot,
-                            x_f, x_f_dot, x_f_dotdot);
-  // Solve for coefficients to compute y
-  vector<double> alpha_y = _alpha(y_i, y_i_dot, y_i_dotdot,
-                            y_f, y_f_dot, y_f_dotdot);
-
-  // Now compute a trajectory of coordinates along this path
+  // Points to contain new trajectory
   vector<double> next_x;
   vector<double> next_y;
+
+  // Set up spline
+  tk::spline s;
+  vector<double> spline_x, spline_y;
+  if (previous_path_x.size() < 3) {
+    // Probably just started, so just put in current location
+    spline_x.push_back(car_x);
+    spline_y.push_back(car_y);
+    next_x.push_back(car_x);
+    next_y.push_back(car_y);
+  } else {
+    // Use previous path points as start of spline
+    for (int i = 0; i <  3; i++) {
+      spline_x.push_back(previous_path_x[i]);
+      spline_y.push_back(previous_path_y[i]);
+      next_x.push_back(previous_path_x[i]);
+      next_y.push_back(previous_path_y[i]);
+    }
+  }
+  // Position after manoeuvre centre of new lane
+  double d_target = new_lane * 4.0 + 2.0;
+  double s_target = car_s + new_speed * _t_manoeuvre;
+  vector<double> xy_t = getXY(s_target,
+                              d_target, _map_waypoints_s,
+                              _map_waypoints_x, _map_waypoints_y);
+  spline_x.push_back(xy_t[0]);
+  spline_y.push_back(xy_t[1]);
+  // Extra position a bit furher ahead
+  vector<double> xy_f = getXY(s_target + 10.0,
+                              d_target, _map_waypoints_s,
+                              _map_waypoints_x, _map_waypoints_y);
+  spline_x.push_back(xy_f[0]);
+  spline_y.push_back(xy_f[1]);
+
+  // Transform coordinate relative to car to prevent spline fitting errors
+  double ref_x = spline_x[0];
+  double ref_y = spline_y[0];
+  for (int i = 0; i < spline_x.size(); i++) {
+    double shift_x = spline_x[i] - ref_x;
+    double shift_y = spline_y[i] - ref_y;
+    spline_x[i] = (shift_x * cos(-car_yaw) - shift_y * sin(-car_yaw));
+    spline_y[i] = (shift_x * sin(-car_yaw) + shift_y * cos(-car_yaw));
+  }
+
+  // Now compute a trajectory of coordinates along this spline
+  s.set_points(spline_x, spline_y);
+  // Transform last available point in trajectory
+  double previous_x = ((next_x.back() - ref_x) * cos(-car_yaw) -
+                       (next_y.back() - ref_y) * sin(-car_yaw));
+  // Build new trajectory points from spline
   for (int i = 0; i < _horizon / dt; i++) {
-    double t = i * dt;
-    double x = x_i + x_i_dot * t + 0.5 * x_i_dotdot * pow(t, 2) +
-               alpha_x[3] * pow(t, 3) + alpha_x[4] * pow(t, 4) +
-               alpha_x[5] * pow(t, 5);
-    double y = y_i + y_i_dot * t + 0.5 * y_i_dotdot * pow(t, 2) +
-               alpha_y[3] * pow(t, 3) + alpha_y[4] * pow(t, 4) +
-               alpha_y[5] * pow(t, 5);
-    next_x.push_back(x);
-    next_y.push_back(y);
+    double new_x = previous_x + new_speed * dt;
+    previous_x = new_x;
+    double new_y = s(new_x);
+    // Restore final point to global coordinate system
+    double shift_x = new_x;
+    double shift_y = new_y;
+    new_x = shift_x * cos(car_yaw) - shift_y * sin(car_yaw) + ref_x;
+    new_y = shift_x * sin(car_yaw) + shift_y * cos(car_yaw) + ref_y;
+    next_x.push_back(new_x);
+    next_y.push_back(new_y);
   }
 
   return {next_x, next_y};
