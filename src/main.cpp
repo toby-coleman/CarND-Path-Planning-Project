@@ -66,10 +66,21 @@ int main() {
   	map_waypoints_dx.push_back(d_x);
   	map_waypoints_dy.push_back(d_y);
   }
+  // Extra points to allow wrap-around of track without discontinuity
+  map_waypoints_x.push_back(map_waypoints_x[0]);
+  map_waypoints_y.push_back(map_waypoints_y[0]);
+  map_waypoints_s.push_back(max_s);
+  map_waypoints_dx.push_back(map_waypoints_dx[0]);
+  map_waypoints_dy.push_back(map_waypoints_dy[0]);
+  map_waypoints_x.push_back(map_waypoints_x[1]);
+  map_waypoints_y.push_back(map_waypoints_y[1]);
+  map_waypoints_s.push_back(max_s+map_waypoints_s[1]);
+  map_waypoints_dx.push_back(map_waypoints_dx[1]);
+  map_waypoints_dy.push_back(map_waypoints_dy[1]);
 
-  // Path planner with 1 second horizon
+  // Path planner with 1.5 second horizon
   PathPlanner plan = PathPlanner(map_waypoints_x, map_waypoints_y,
-                                 map_waypoints_s, 1.0);
+                                 map_waypoints_s, 1.0, true);
  plan.target.lane = 1;    // Car starts in lane 1
  plan.target.speed = 2.0;  // Initialise with a forward motion target
 

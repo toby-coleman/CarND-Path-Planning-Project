@@ -12,12 +12,13 @@
 PathPlanner::PathPlanner(vector<double> map_waypoints_x,
                          vector<double> map_waypoints_y,
                          vector<double> map_waypoints_s,
-                         double horizon) {
+                         double horizon, bool debug) {
   // Initialisation
   _map_waypoints_x = map_waypoints_x;
   _map_waypoints_y = map_waypoints_y;
   _map_waypoints_s = map_waypoints_s;
   _horizon = horizon;
+  _debug = debug;
 }
 
 vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
@@ -60,23 +61,44 @@ vector<vector<double>> PathPlanner::update(double car_x_, double car_y_,
   double min_cost = 1000000.0;
   int min_cost_index = 0;
   for (int s = 0; s < new_states.size(); s++) {
-    cout.precision(4);
-    cout << new_states[s] << ": " << costs[s] << ", ";
     if (costs[s] < min_cost) {
       min_cost = costs[s];
       min_cost_index = s;
     }
   }
-  cout << endl;
-  cout << "Action: " << new_states[min_cost_index] << endl;
-  // Print info on closest car under this trajectory
-  vector<double> close = _closest_car(candidate_trajectories[min_cost_index],
-                                      predictions);
-  cout << "Closest obstacles in [s, d, cartesian]: " << close[0] << ", "
-       << close[1] << ", " << close[2] << endl;
-  // Update target
+
+  // Print debug info
+  if (_debug) {
+    cout << "Car s: " << car_s << ", d: " << car_d << endl;
+    cout << "Target lane: " << new_targets[min_cost_index].lane << endl;
+    vector<double> close_i = _closest_car(candidate_trajectories[0],
+                                          predictions,
+                                          predictions[0][0].size() - 1);
+    cout << "d: [" << close_i[0] << ", " << close_i[1] << ", "
+         << close_i[2] << ", " << close_i[3] << "]";
+    cout << endl;
+    for (int s = 0; s < new_states.size(); s++) {
+      if (s == min_cost_index) {
+        cout << "** ";
+      } else {
+        cout << "   ";
+      }
+      cout << new_states[s] << ": " << costs[s] << " - ";
+      vector<double> close = _closest_car(candidate_trajectories[s],
+                                          predictions,
+                                          predictions[0][0].size() - 1);
+      cout << "d: [" << close[0] << ", " << close[1] << ", "
+           << close[2] << ", " << close[3] << "]";
+      cout << " - " << _closest_cartesian(candidate_trajectories[s],
+                                          predictions);
+      cout << endl;
+    }
+  }
+  // Update record of last lane s
+  if (target.lane != new_targets[min_cost_index].lane) {
+    _xy_last_lane = {car_x, car_y};
+  }
   target = new_targets[min_cost_index];
-  cout << "Target speed: " << target.speed << ", lane: " << target.lane << endl;
   // Update state
   car_state = new_states[min_cost_index];
 
@@ -92,6 +114,8 @@ PathPlanner::Target PathPlanner::_action(string state) {
     new_target = {target.speed + 0.1, target.lane};
   } else if (state == "DECEL") {
     new_target = {target.speed - 0.1, target.lane};
+  } else if (state == "DECEL+") {
+    new_target = {target.speed - 0.2, target.lane};
   } else if (state == "LEFT") {
     new_target = {target.speed, target.lane - 1};
   } else if (state == "RIGHT") {
@@ -104,9 +128,13 @@ vector<string> PathPlanner::valid_states() {
   // Returns valid actions
   vector<string> valid = _all_states;
   if (car_state == "ACCEL") {
-    // Remove DECEL
+    // Remove DECEL, DECEL+
     valid.erase(remove(valid.begin(), valid.end(), "DECEL"), valid.end());
+    valid.erase(remove(valid.begin(), valid.end(), "DECEL+"), valid.end());
   } else if (car_state == "DECEL") {
+    // Remove ACCEL
+    valid.erase(remove(valid.begin(), valid.end(), "ACCEL"), valid.end());
+  } else if (car_state == "DECEL+") {
     // Remove ACCEL
     valid.erase(remove(valid.begin(), valid.end(), "ACCEL"), valid.end());
   }
@@ -126,6 +154,7 @@ double PathPlanner::_cost(PathPlanner::Target new_target,
                           vector<vector<vector<double>>> predictions) {
   // Cost function for candidate trajectory
   double cost = 0;
+  vector<double> closest;
 
   double s_f = getFrenet(trajectory[0].back(), trajectory[1].back(),
                          car_yaw, _map_waypoints_x, _map_waypoints_y)[0];
@@ -135,25 +164,53 @@ double PathPlanner::_cost(PathPlanner::Target new_target,
     double speed = distance(trajectory[0][i], trajectory[1][i],
                             trajectory[0][i - 1], trajectory[1][i - 1]) / dt;
     // Make speeds in the wrong direction negative
-    if (s_f < car_s) {
+    if ((s_f < car_s) && (fabs(s_f - car_s) < 0.9 * _max_s)) {
       speed = -speed;
     }
     // Low speed
-    cost += 0.1 * sigmoid(5.0 - speed);
+    cost += 2 * sigmoid(5.0 - speed);
     // High speed
     cost += sigmoid(10 * (speed - speed_limit + 1.0));
   }
   // Closest vehicles (avoid collisions and keep following distance)
-  vector<double> closest_sd = _closest_car(trajectory, predictions);
-  cost += trajectory.size() * (5.0 * sigmoid(6.0 - closest_sd[0]) +
-                               50.0 * sigmoid(10 * (2.5 - closest_sd[0])));
-  cost += 30 * trajectory.size() * sigmoid(20 * (2.0 - closest_sd[1]));
-  // Use cartesian distance to penalise collisions
-  cost += 1000 * sigmoid(15 * (2.5 - closest_sd[2]));
-  // Lane change penalty
-  if (target.lane != new_target.lane) {
-    cost += 50;
+  closest = _closest_car(trajectory, predictions, 0);
+  // Favour decelarion if close to vehicle in front
+  if (new_target.speed >= target.speed) {
+    cost += 20 * sigmoid(20.0 - closest[0]);
   }
+  // Check for vehicles to left and right
+  if ((closest[2] < 4.5) && (new_target.lane < target.lane)) {
+    // Penalise left change
+    cost += 135;
+  }
+  if ((closest[3] < 4.5) && (new_target.lane > target.lane)) {
+    // Penalise right change
+    cost += 135;
+  }
+
+  // Vehicle positions at the end of manoeuvre
+  closest = _closest_car(trajectory, predictions,
+                                        predictions[0][0].size() - 1);
+  // Check for vehicles ahead
+  cost += 20 * sigmoid(20.0 - closest[0]);
+  // Penslise vehicles in same lane (potential collision)
+  if ((closest[2] < 2.0) || (closest[3] < 2.0)) {
+    cost += 100;
+  }
+
+  // Compute nearest cartesian distance to another vehicle
+  double dist = _closest_cartesian(trajectory, predictions);
+  // Penalise lane changes
+  if (new_target.lane != target.lane) {
+    cost += 15;
+    // Penalise repeated lane changes within 100m
+    if (distance(car_x, car_y, _xy_last_lane[0], _xy_last_lane[1]) < 100) {
+      cost += 125;
+    }
+    // Penalise lane changes that come within 10m of another vehicle
+    cost += 150 * sigmoid(10 * (8.0 - dist));
+  }
+
   return cost;
 }
 
@@ -169,6 +226,7 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
   // Set up spline
   tk::spline s;
   vector<double> spline_x, spline_y;
+
   if (previous_path_x.size() < 3) {
     // Probably just started, so just put in current location
     spline_x.push_back(car_x);
@@ -187,13 +245,15 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
   // Position after manoeuvre centre of new lane
   double d_target = new_lane * 4.0 + 2.0;
   double s_target = car_s + new_speed * _t_manoeuvre;
+  s_target = fmod(s_target, _max_s);
   vector<double> xy_t = getXY(s_target,
                               d_target, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   spline_x.push_back(xy_t[0]);
   spline_y.push_back(xy_t[1]);
   // Extra position a bit furher ahead
-  vector<double> xy_f = getXY(s_target + 10.0,
+  s_target = fmod(s_target + 10.0, _max_s);
+  vector<double> xy_f = getXY(s_target,
                               d_target, _map_waypoints_s,
                               _map_waypoints_x, _map_waypoints_y);
   spline_x.push_back(xy_f[0]);
@@ -214,11 +274,16 @@ vector<vector<double>> PathPlanner::_trajectory(vector<double> previous_path_x,
   // Transform last available point in trajectory
   double previous_x = ((next_x.back() - ref_x) * cos(-car_yaw) -
                        (next_y.back() - ref_y) * sin(-car_yaw));
+  double previous_y = ((next_x.back() - ref_x) * sin(-car_yaw) +
+                       (next_y.back() - ref_y) * cos(-car_yaw));
   // Build new trajectory points from spline
   for (int i = 0; i < _horizon / dt; i++) {
-    double new_x = previous_x + new_speed * dt;
-    previous_x = new_x;
+    double theta = atan2(previous_y, previous_x);
+    double new_x = previous_x + new_speed * cos(theta) * dt;
     double new_y = s(new_x);
+    previous_x = new_x;
+    previous_y = new_y;
+
     // Restore final point to global coordinate system
     double shift_x = new_x;
     double shift_y = new_y;
@@ -258,13 +323,33 @@ vector<vector<vector<double>>> PathPlanner::_predict(
   return predictions;
 }
 
+double PathPlanner::_closest_cartesian(vector<vector<double>> trajectory,
+                          vector<vector<vector<double>>> predictions) {
+  // Closest cartesian distance over the whole prediction horizon
+  double nearest = 100000;
+  for (int i = 0; i < predictions[0][0].size(); i++) {
+    // Our car location
+    double x = trajectory[0][i];
+    double y = trajectory[1][i];
+    // Other car locations
+    for (int v = 0; v < predictions.size(); v++) {
+      double other_x = predictions[v][0][i];
+      double other_y = predictions[v][1][i];
+      double dist = distance(x, y, other_x, other_y);
+      if (dist < nearest) {
+        nearest = dist;
+      }
+    }
+  }
+  return nearest;
+}
+
 vector<double> PathPlanner::_closest_car(vector<vector<double>> trajectory,
-                                 vector<vector<vector<double>>> predictions) {
+                                 vector<vector<vector<double>>> predictions,
+                                 int i) {
   // Compute distance to the other vehicles along the trajectory and return
-  // the closest s and d values, along with closest cartiesian distance
-  double closest_s = 10000; // large number
-  double closest_d = 10000;
-  double closest = 10000;
+  // [closest_s in front, closest_s behind, closest_d to left, closest_d]
+  // at timestep i
 
   // Compute heading of the other vehicles
   vector<double> headings;
@@ -273,38 +358,50 @@ vector<double> PathPlanner::_closest_car(vector<vector<double>> trajectory,
                            predictions[v][1][1] - predictions[v][1][0]);
     headings.push_back(heading);
   }
-  // Loop over time
-  for (int i = 0; i < trajectory[0].size(); i++) {
-    // Our car location
-    double x = trajectory[0][i];
-    double y = trajectory[1][i];
-    vector<double> sd = getFrenet(x, y,
-                                  car_yaw, _map_waypoints_x, _map_waypoints_y);
-    // Loop over other vehicles
-    for (int v = 0; v < predictions.size(); v++) {
-      double other_x = predictions[v][0][i];
-      double other_y = predictions[v][1][i];
-      double dist = distance(x, y, other_x, other_y);
-      vector<double> other_sd = getFrenet(other_x, other_y,
-                              headings[v], _map_waypoints_x, _map_waypoints_y);
-      // Save closest pass in s and d directions
-      if ((abs(other_sd[0] - sd[0]) < closest_s) &&
-          (abs(other_sd[1] - sd[1]) < 1.0)) {
-        // Closest s distance for cars in the same lane
-        closest_s = abs(other_sd[0] - sd[0]);
-      }
-      if ((abs(other_sd[1] - sd[1]) < closest_d) &&
-          (abs(other_sd[0] - sd[0]) < 5.0)) {
-        // Closest d distance for cars alongside us (nearby in s)
-        closest_d = abs(other_sd[1] - sd[1]);
-      }
-      if (dist < closest) {
-        // Closest cartesian distance
-        closest = dist;
-      }
+
+  // Initial distances
+  double closest_sf = 10000; // large number
+  double closest_sb = 10000;
+  double closest_dl = 10000;
+  double closest_dr = 10000;
+
+  // Our car location
+  double x = trajectory[0][i];
+  double y = trajectory[1][i];
+  vector<double> sd = getFrenet(x, y,
+                                car_yaw, _map_waypoints_x, _map_waypoints_y);
+  // Loop over other vehicles
+  for (int v = 0; v < predictions.size(); v++) {
+    double other_x = predictions[v][0][i];
+    double other_y = predictions[v][1][i];
+
+    vector<double> other_sd = getFrenet(other_x, other_y,
+                            car_yaw, _map_waypoints_x, _map_waypoints_y);
+
+    // Save closest s in front
+    if ((other_sd[0] - sd[0] > 0) && (abs(other_sd[1] - sd[1]) < 2.0) &&
+       (abs(other_sd[0] - sd[0]) < closest_sf)) {
+      closest_sf = abs(other_sd[0] - sd[0]);
+    }
+    // Save closest s behind
+    if ((other_sd[0] - sd[0] < 0) && (abs(other_sd[1] - sd[1]) < 2.0) &&
+       (abs(other_sd[0] - sd[0]) < closest_sb)) {
+      closest_sb = abs(other_sd[0] - sd[0]);
+    }
+    // Save closest pass in d left
+    if ((other_sd[1] - sd[1] < 0) && (other_sd[0] - sd[0] < 25.0) &&
+       (other_sd[0] - sd[0] > -15.0) &&
+       (abs(other_sd[1] - sd[1]) < closest_sb)) {
+      closest_dl = abs(other_sd[1] - sd[1]);
+    }
+    // Save closest pass in d right
+    if ((other_sd[1] - sd[1] > 0) && (other_sd[0] - sd[0] < 25.0) &&
+       (other_sd[0] - sd[0] > -15.0) &&
+       (abs(other_sd[1] - sd[1]) < closest_sb)) {
+      closest_dr = abs(other_sd[1] - sd[1]);
     }
   }
-  return {closest_s, closest_d, closest};
+  return {closest_sf, closest_sb, closest_dl, closest_dr};
 }
 
 // Utility functions copied from main.cpp template
@@ -315,124 +412,124 @@ double rad2deg(double x) { return x * 180 / pi(); }
 
 double distance(double x1, double y1, double x2, double y2)
 {
-	return sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+  return sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
 }
 
 int ClosestWaypoint(double x, double y,
                     vector<double> maps_x, vector<double> maps_y) {
 
-	double closestLen = 100000; //large number
-	int closestWaypoint = 0;
+  double closestLen = 100000; //large number
+  int closestWaypoint = 0;
 
-	for(int i = 0; i < maps_x.size(); i++)
-	{
-		double map_x = maps_x[i];
-		double map_y = maps_y[i];
-		double dist = distance(x, y, map_x, map_y);
-		if(dist < closestLen)
-		{
-			closestLen = dist;
-			closestWaypoint = i;
-		}
-	}
+  for(int i = 0; i < maps_x.size(); i++)
+  {
+  double map_x = maps_x[i];
+  double map_y = maps_y[i];
+  double dist = distance(x, y, map_x, map_y);
+  if(dist < closestLen)
+  {
+  closestLen = dist;
+  closestWaypoint = i;
+  }
+  }
 
-	return closestWaypoint;
+  return closestWaypoint;
 }
 
 int NextWaypoint(double x, double y, double theta,
                  vector<double> maps_x, vector<double> maps_y) {
 
-	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
+  int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
 
-	double map_x = maps_x[closestWaypoint];
-	double map_y = maps_y[closestWaypoint];
+  double map_x = maps_x[closestWaypoint];
+  double map_y = maps_y[closestWaypoint];
 
-	double heading = atan2((map_y - y), (map_x - x));
+  double heading = atan2((map_y - y), (map_x - x));
 
-	double angle = abs(theta - heading);
+  double angle = abs(theta - heading);
 
-	if(angle > pi() / 4)
-	{
-		closestWaypoint++;
-	}
+  if(angle > pi() / 4)
+  {
+  closestWaypoint = (closestWaypoint+1) % maps_x.size();
+  }
 
-	return closestWaypoint;
+  return closestWaypoint;
 }
 
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
 vector<double> getFrenet(double x, double y, double theta,
                          vector<double> maps_x, vector<double> maps_y) {
-	int next_wp = NextWaypoint(x,y, theta, maps_x, maps_y);
+  int next_wp = NextWaypoint(x,y, theta, maps_x, maps_y);
 
-	int prev_wp;
-	prev_wp = next_wp - 1;
-	if(next_wp == 0)
-	{
-		prev_wp  = maps_x.size() - 1;
-	}
+  int prev_wp;
+  prev_wp = next_wp - 1;
+  if(next_wp == 0)
+  {
+  prev_wp  = maps_x.size() - 1;
+  }
 
-	double n_x = maps_x[next_wp] - maps_x[prev_wp];
-	double n_y = maps_y[next_wp] - maps_y[prev_wp];
-	double x_x = x - maps_x[prev_wp];
-	double x_y = y - maps_y[prev_wp];
+  double n_x = maps_x[next_wp] - maps_x[prev_wp];
+  double n_y = maps_y[next_wp] - maps_y[prev_wp];
+  double x_x = x - maps_x[prev_wp];
+  double x_y = y - maps_y[prev_wp];
 
-	// find the projection of x onto n
-	double proj_norm = (x_x * n_x + x_y * n_y) / (n_x * n_x + n_y * n_y);
-	double proj_x = proj_norm * n_x;
-	double proj_y = proj_norm * n_y;
+  // find the projection of x onto n
+  double proj_norm = (x_x * n_x + x_y * n_y) / (n_x * n_x + n_y * n_y);
+  double proj_x = proj_norm * n_x;
+  double proj_y = proj_norm * n_y;
 
-	double frenet_d = distance(x_x, x_y, proj_x, proj_y);
+  double frenet_d = distance(x_x, x_y, proj_x, proj_y);
 
-	//see if d value is positive or negative by comparing it to a center point
+  //see if d value is positive or negative by comparing it to a center point
 
-	double center_x = 1000 - maps_x[prev_wp];
-	double center_y = 2000 - maps_y[prev_wp];
-	double centerToPos = distance(center_x, center_y, x_x, x_y);
-	double centerToRef = distance(center_x, center_y, proj_x, proj_y);
+  double center_x = 1000 - maps_x[prev_wp];
+  double center_y = 2000 - maps_y[prev_wp];
+  double centerToPos = distance(center_x, center_y, x_x, x_y);
+  double centerToRef = distance(center_x, center_y, proj_x, proj_y);
 
-	if(centerToPos <= centerToRef)
-	{
-		frenet_d *= -1;
-	}
+  if(centerToPos <= centerToRef)
+  {
+  frenet_d *= -1;
+  }
 
-	// calculate s value
-	double frenet_s = 0;
-	for(int i = 0; i < prev_wp; i++)
-	{
-		frenet_s += distance(maps_x[i], maps_y[i], maps_x[i + 1], maps_y[i + 1]);
-	}
+  // calculate s value
+  double frenet_s = 0;
+  for(int i = 0; i < prev_wp; i++)
+  {
+  frenet_s += distance(maps_x[i], maps_y[i], maps_x[i + 1], maps_y[i + 1]);
+  }
 
-	frenet_s += distance(0, 0, proj_x, proj_y);
+  frenet_s += distance(0, 0, proj_x, proj_y);
 
-	return {frenet_s, frenet_d};
+  return {frenet_s, frenet_d};
 }
 
 // Transform from Frenet s,d coordinates to Cartesian x,y
 vector<double> getXY(double s, double d, vector<double> maps_s,
                      vector<double> maps_x, vector<double> maps_y) {
-	int prev_wp = -1;
+  int prev_wp = -1;
 
-	while(s > maps_s[prev_wp + 1] && (prev_wp < (int)(maps_s.size() - 1)))
-	{
-		prev_wp++;
-	}
+  while(s > maps_s[prev_wp + 1] && (prev_wp < (int)(maps_s.size() - 1)))
+  {
+  prev_wp++;
+  }
 
-	int wp2 = (prev_wp + 1) % maps_x.size();
+  int wp2 = (prev_wp + 1) % maps_x.size();
 
-	double heading = atan2((maps_y[wp2] - maps_y[prev_wp]),
+  double heading = atan2((maps_y[wp2] - maps_y[prev_wp]),
                          (maps_x[wp2] - maps_x[prev_wp]));
-	// the x,y,s along the segment
-	double seg_s = (s-maps_s[prev_wp]);
+  // the x,y,s along the segment
+  double seg_s = (s-maps_s[prev_wp]);
 
-	double seg_x = maps_x[prev_wp] + seg_s * cos(heading);
-	double seg_y = maps_y[prev_wp] + seg_s * sin(heading);
+  double seg_x = maps_x[prev_wp] + seg_s * cos(heading);
+  double seg_y = maps_y[prev_wp] + seg_s * sin(heading);
 
-	double perp_heading = heading-pi() / 2;
+  double perp_heading = heading-pi() / 2;
 
-	double x = seg_x + d * cos(perp_heading);
-	double y = seg_y + d * sin(perp_heading);
+  double x = seg_x + d * cos(perp_heading);
+  double y = seg_y + d * sin(perp_heading);
 
-	return {x,y};
+  return {x,y};
 }
 
 double sigmoid(double x) {

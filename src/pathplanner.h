@@ -20,9 +20,16 @@ private:
   // Horizon (how far the points should be mapped into the future)
   double _horizon;
   // Manoeuvring time (used for path planning)
-  double _t_manoeuvre = 2.5;
-  // All possible states
-  vector<string> _all_states = {"KL", "ACCEL", "DECEL", "LEFT", "RIGHT"};
+  double _t_manoeuvre = 2.0;
+  // Max s of track
+  double _max_s = 6945.554;
+  // Last lane change in xy coordinates
+  vector<double> _xy_last_lane = {0, 0};
+  // All possible states in order of preference given equal cost
+  vector<string> _all_states = {"KL", "DECEL+", "DECEL", "ACCEL",
+                                "LEFT", "RIGHT"};
+  // Debug mode
+  bool _debug = false;
 
   // Converts a state into a new speed and lane
   Target _action(string state);
@@ -35,9 +42,13 @@ private:
                vector<vector<vector<double>>> predictions);
   // Predict function
   vector<vector<vector<double>>> _predict(vector<vector<double>> sensor_fusion);
-  // Closest car distance {s, d, cartesian}
+  // Closest car distance {sf, sb, dl, dr}
   vector<double> _closest_car(vector<vector<double>> trajectory,
-                              vector<vector<vector<double>>> predictions);
+                              vector<vector<vector<double>>> predictions,
+                              int i);
+  // Closest car (cartesian distance over whole trajectory)
+  double _closest_cartesian(vector<vector<double>> trajectory,
+                            vector<vector<vector<double>>> predictions);
 public:
   // Speed limit
   double speed_limit = 50 * 0.44704; // 50 mph
@@ -59,7 +70,7 @@ public:
   PathPlanner(vector<double> map_waypoints_x,
     vector<double> map_waypoints_y,
     vector<double> map_waypoints_s,
-    double horizon);
+    double horizon, bool debug=false);
 
   // Valid states
   vector<string> valid_states();
