@@ -78,7 +78,7 @@ int main() {
   map_waypoints_dx.push_back(map_waypoints_dx[1]);
   map_waypoints_dy.push_back(map_waypoints_dy[1]);
 
-  // Path planner with 1.5 second horizon
+  // Path planner with 1 second horizon
   PathPlanner plan = PathPlanner(map_waypoints_x, map_waypoints_y,
                                  map_waypoints_s, 1.0, true);
  plan.target.lane = 1;    // Car starts in lane 1
